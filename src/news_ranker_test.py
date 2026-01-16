@@ -10,6 +10,8 @@ from src.news_ranker import (
     get_database_connection,
     ScoringEngine,
     RankingHead,
+    HierarchicalAttentionRanker,
+    compute_calibration_params,
 )
 
 
@@ -49,6 +51,18 @@ def test_initialize_database_creates_table():
 
 
 # ##################################################################
+# test initialize database adds cleaned html column
+# verifies the articles table includes cleaned_html_text column
+def test_initialize_database_adds_cleaned_html_column():
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(articles)")
+    columns = {row[1] for row in cursor.fetchall()}
+    conn.close()
+    assert "cleaned_html_text" in columns
+
+
+# ##################################################################
 # test ranking head forward
 # verifies the neural network produces correct output shape
 def test_ranking_head_forward():
@@ -57,6 +71,17 @@ def test_ranking_head_forward():
     test_input = torch.randn(1, EMBEDDING_DIM)
     output = ranker(test_input)
     assert output.shape == (1, 1)
+
+
+# ##################################################################
+# test hierarchical attention ranker forward
+# verifies hierarchical attention produces a scalar output
+def test_hierarchical_attention_ranker_forward():
+    import torch
+    ranker = HierarchicalAttentionRanker(EMBEDDING_DIM)
+    chunk = torch.randn(3, EMBEDDING_DIM)
+    output = ranker([chunk])
+    assert output.shape == (1,)
 
 
 # ##################################################################
@@ -70,54 +95,75 @@ def test_scoring_engine_initialization():
 
 
 # ##################################################################
-# test chunk text empty
-# verifies empty text returns empty chunks
-def test_chunk_text_empty():
+# test split into sentences empty
+# verifies empty text returns empty sentence list
+def test_split_into_sentences_empty():
     engine = ScoringEngine()
-    chunks = engine.chunk_text("")
+    sentences = engine.split_into_sentences("")
+    assert sentences == []
+
+
+# ##################################################################
+# test split into sentences
+# verifies sentence splitting respects punctuation
+def test_split_into_sentences():
+    engine = ScoringEngine()
+    text = "First sentence. Second sentence! Third sentence?"
+    sentences = engine.split_into_sentences(text)
+    assert sentences == ["First sentence.", "Second sentence!", "Third sentence?"]
+
+
+# ##################################################################
+# test chunk sentences short
+# verifies short sentence list returns single chunk
+def test_chunk_sentences_short():
+    engine = ScoringEngine()
+    sentences = ["Short sentence one.", "Short sentence two."]
+    chunks = engine.chunk_sentences(sentences)
+    assert len(chunks) == 1
+    assert chunks[0] == sentences
+
+
+# ##################################################################
+# test chunk sentences long
+# verifies long sentence list is split into multiple chunks
+def test_chunk_sentences_long():
+    engine = ScoringEngine()
+    sentences = ["word " * 250, "word " * 250, "word " * 250]
+    chunks = engine.chunk_sentences(sentences)
+    assert len(chunks) == 2
+
+
+# ##################################################################
+# test build hierarchical embeddings produces correct dimension
+# verifies embeddings return sentence vectors with expected size
+def test_build_hierarchical_embeddings_produces_correct_dimension():
+    engine = ScoringEngine()
+    text = "This is a test article about technology and programming."
+    chunks = engine.build_hierarchical_embeddings(text)
+    assert len(chunks) == 1
+    assert chunks[0].shape[1] == EMBEDDING_DIM
+
+
+# ##################################################################
+# test build hierarchical embeddings empty returns empty
+# verifies empty text returns no chunks
+def test_build_hierarchical_embeddings_empty_returns_empty():
+    engine = ScoringEngine()
+    chunks = engine.build_hierarchical_embeddings("")
     assert chunks == []
 
 
 # ##################################################################
-# test chunk text short
-# verifies short text returns single chunk
-def test_chunk_text_short():
-    engine = ScoringEngine()
-    text = "This is a short piece of text."
-    chunks = engine.chunk_text(text)
-    assert len(chunks) == 1
-    assert chunks[0] == text
-
-
-# ##################################################################
-# test chunk text long
-# verifies long text is split into multiple chunks
-def test_chunk_text_long():
-    engine = ScoringEngine()
-    text = " ".join(["word"] * 1200)
-    chunks = engine.chunk_text(text)
-    assert len(chunks) == 3  # 1200 words / 500 words per chunk = 3 chunks
-
-
-# ##################################################################
-# test vectorize text produces correct dimension
-# verifies vectorization returns expected embedding size
-def test_vectorize_text_produces_correct_dimension():
-    engine = ScoringEngine()
-    text = "This is a test article about technology and programming."
-    vector = engine.vectorize_text(text)
-    assert vector.shape == (EMBEDDING_DIM,)
-
-
-# ##################################################################
-# test vectorize text empty returns zeros
-# verifies empty text returns zero vector
-def test_vectorize_text_empty_returns_zeros():
+# test compute document mean vector
+# verifies document mean vector is computed from chunks
+def test_compute_document_mean_vector():
     import torch
     engine = ScoringEngine()
-    vector = engine.vectorize_text("")
+    chunk = torch.ones(3, EMBEDDING_DIM)
+    vector = engine.compute_document_mean_vector([chunk])
+    assert vector is not None
     assert vector.shape == (EMBEDDING_DIM,)
-    assert torch.allclose(vector, torch.zeros(EMBEDDING_DIM, device=vector.device))
 
 
 # ##################################################################
@@ -149,8 +195,10 @@ def test_get_embedding_bytes():
     text = "Test article content."
     embedding_bytes = engine.get_embedding_bytes(text)
     assert isinstance(embedding_bytes, bytes)
-    vector = pickle.loads(embedding_bytes)
-    assert vector.shape == (EMBEDDING_DIM,)
+    chunks = pickle.loads(embedding_bytes)
+    assert isinstance(chunks, list)
+    assert chunks
+    assert chunks[0].shape[1] == EMBEDDING_DIM
 
 
 # ##################################################################
@@ -244,6 +292,24 @@ def test_clean_html_text_empty():
     from src.news_ranker import clean_html_text
     assert clean_html_text("") == ""
     assert clean_html_text("   ") == ""
+
+
+# ##################################################################
+# test compute calibration params
+# verifies min/max mapping for calibration
+def test_compute_calibration_params():
+    scale, bias = compute_calibration_params(2.0, 4.0, 1.0, 10.0)
+    assert abs((2.0 * scale + bias) - 1.0) < 1e-6
+    assert abs((4.0 * scale + bias) - 10.0) < 1e-6
+
+
+# ##################################################################
+# test compute calibration params no range
+# verifies zero-range predictions keep defaults
+def test_compute_calibration_params_no_range():
+    scale, bias = compute_calibration_params(2.0, 2.0, 1.0, 10.0)
+    assert scale == 1.0
+    assert bias == 0.0
 
 
 # ##################################################################
