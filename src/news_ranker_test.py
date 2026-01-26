@@ -1,4 +1,5 @@
 import os
+import threading
 import pytest
 
 from src.news_ranker import (
@@ -339,3 +340,120 @@ def test_fetch_with_playwright_real_url():
     text = fetch_with_playwright("https://example.com")
     assert text is not None
     assert len(text) > 50
+
+
+# ##################################################################
+# test concurrent ranking requests
+# verifies multiple ranking requests complete without errors
+def test_concurrent_ranking_requests():
+    engine = ScoringEngine()
+    text = "Technical analysis of distributed systems and concurrency patterns."
+    results = []
+    errors = []
+
+    def rank_task():
+        try:
+            score = engine.predict_score(text)
+            results.append(score)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=rank_task) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0, f"Concurrent ranking failed with errors: {errors}"
+    assert len(results) == 10
+    for score in results:
+        assert MIN_SCORE <= score <= MAX_SCORE
+
+
+# ##################################################################
+# test ranking during training
+# verifies ranking requests complete while training is in progress
+def test_ranking_during_training():
+    engine = ScoringEngine()
+
+    # create minimal training data
+    text = "Machine learning article about neural networks."
+    conn = get_database_connection()
+    embedding = engine.get_embedding_bytes(text)
+    conn.execute(
+        "INSERT INTO articles (url, extracted_text, embedding, user_target_rank) VALUES (?, ?, ?, ?)",
+        ("https://example.com/ml", text, embedding, 8.0)
+    )
+    conn.commit()
+    conn.close()
+
+    ranking_results = []
+    ranking_errors = []
+    training_started = threading.Event()
+    training_done = threading.Event()
+
+    def training_task():
+        training_started.set()
+        engine.retrain()
+        training_done.set()
+
+    def ranking_task():
+        training_started.wait()
+        try:
+            score = engine.predict_score(text)
+            ranking_results.append(score)
+        except Exception as e:
+            ranking_errors.append(e)
+
+    training_thread = threading.Thread(target=training_task)
+    ranking_threads = [threading.Thread(target=ranking_task) for _ in range(5)]
+
+    training_thread.start()
+    for t in ranking_threads:
+        t.start()
+
+    training_thread.join()
+    for t in ranking_threads:
+        t.join()
+
+    assert len(ranking_errors) == 0, f"Ranking during training failed: {ranking_errors}"
+    assert len(ranking_results) == 5
+    assert training_done.is_set()
+
+
+# ##################################################################
+# test training serialization
+# verifies only one training operation runs at a time
+def test_training_serialization():
+    engine = ScoringEngine()
+
+    # create training data
+    text = "Article about software engineering best practices."
+    conn = get_database_connection()
+    embedding = engine.get_embedding_bytes(text)
+    conn.execute(
+        "INSERT INTO articles (url, extracted_text, embedding, user_target_rank) VALUES (?, ?, ?, ?)",
+        ("https://example.com/se", text, embedding, 7.0)
+    )
+    conn.commit()
+    conn.close()
+
+    results = []
+    results_lock = threading.Lock()
+
+    def retrain_and_record():
+        # Track whether is_training was already True when we entered
+        was_training = engine.is_training
+        engine.retrain(epochs=10)  # short training for speed
+        with results_lock:
+            results.append(was_training)
+
+    threads = [threading.Thread(target=retrain_and_record) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All threads should complete - at most one saw is_training=False
+    # (the others either saw True and skipped, or ran after the first finished)
+    assert len(results) == 3

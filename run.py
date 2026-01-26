@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+# Change to script directory so relative paths work when run from anywhere
+os.chdir(Path(__file__).parent)
+
+TEST_OUT = Path("output/testing")
+SERVER_URL = "http://localhost:19091"
+
+
+# ##################################################################
+# run command
+# executes a shell command and returns exit code
+def run_command(cmd: list[str]) -> int:
+    return subprocess.call(cmd)
+
+
+# ##################################################################
+# command rank
+# calls the server api to rank a url, optionally training it with a score
+def command_rank(args: argparse.Namespace) -> int:
+    params = urllib.parse.urlencode({"url": args.url})
+    target = f"{SERVER_URL}/rank?{params}"
+    try:
+        with urllib.request.urlopen(target, timeout=60) as response:
+            data = json.load(response)
+            print(json.dumps(data, indent=2))
+    except urllib.error.URLError as err:
+        print(f"Error: Could not connect to server at {SERVER_URL}")
+        print("Make sure the server is running with: ./run serve")
+        print(f"Details: {err}")
+        return 1
+
+    if args.score is not None:
+        result = server_request("/correct_rank", method="POST", data={"url": args.url, "score": args.score})
+        if result.get("status") == "error":
+            print(f"Error training: {result.get('message')}")
+            return 1
+        print(f"Trained: {args.score:.1f} <- {args.url}")
+
+    return 0
+
+
+# ##################################################################
+# command test
+# runs pytest for a specific test target, writing logs to output/testing
+def command_test(args: argparse.Namespace) -> int:
+    TEST_OUT.mkdir(parents=True, exist_ok=True)
+    target = args.target
+    log = TEST_OUT / (target.replace("/", "_").replace("::", "_") + ".log")
+    cmd = ["pytest", "-q", target, "--maxfail=1", "--disable-warnings"]
+    with open(log, "w") as f:
+        result = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT)
+    print(f"Test output written to {log}")
+    return result
+
+
+# ##################################################################
+# command lint
+# runs ruff linter with 120 char line length
+def command_lint(args: argparse.Namespace) -> int:
+    return run_command(["ruff", "check", "--line-length", "120", "src/"])
+
+
+# ##################################################################
+# command serve
+# starts the news ranker server
+def command_serve(args: argparse.Namespace) -> int:
+    return run_command([sys.executable, "-m", "src.news_ranker"])
+
+
+# ##################################################################
+# command check
+# runs full test suite and quality gates
+def command_check(args: argparse.Namespace) -> int:
+    TEST_OUT.mkdir(parents=True, exist_ok=True)
+    lint_result = command_lint(args)
+    if lint_result != 0:
+        print("Lint failed")
+        return lint_result
+    test_result = run_command(["pytest", "-q", "src/", "-W", "error", "--disable-warnings"])
+    if test_result != 0:
+        print("Tests failed")
+        return test_result
+    print("All checks passed")
+    return 0
+
+
+# ##################################################################
+# server request helper
+# makes a request to the server and handles errors
+def server_request(endpoint: str, method: str = "GET", data: dict = None, timeout: int = 300) -> dict:
+    url = f"{SERVER_URL}{endpoint}"
+    try:
+        if method == "POST":
+            req_data = json.dumps(data).encode("utf-8") if data else b""
+            req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return json.load(response)
+        else:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return json.load(response)
+    except urllib.error.URLError as err:
+        return {"status": "error", "message": f"Could not connect to server: {err}"}
+
+
+# ##################################################################
+# command fetch training
+# fetches text for training urls missing extracted or cleaned html text
+def command_fetch_training(args: argparse.Namespace) -> int:
+    print("Fetching text for training URLs (this may take a while)...")
+    result = server_request("/fetch_training", method="POST", timeout=600)
+
+    if result.get("status") == "error":
+        print(f"Error: {result.get('message')}")
+        print("Make sure the server is running with: ./run serve")
+        return 1
+
+    print(result.get("message", "Done"))
+    return 0
+
+
+# ##################################################################
+# command retrain
+# calls server to run intensive retraining
+def command_retrain(args: argparse.Namespace) -> int:
+    print("Requesting intensive retrain from server...")
+    result = server_request("/retrain", method="POST")
+
+    if result.get("status") == "error":
+        print(f"Error: {result.get('message')}")
+        print("Make sure the server is running with: ./run serve")
+        return 1
+
+    print(f"Training samples: {result.get('training_samples', 'unknown')}")
+    print(result.get("message", "Retraining initiated"))
+    print("\nNote: Retraining runs in background. Check server logs for progress.")
+    return 0
+
+
+# ##################################################################
+# command train
+# sends a single training example to server
+def command_train(args: argparse.Namespace) -> int:
+    result = server_request("/correct_rank", method="POST", data={"url": args.url, "score": args.score})
+
+    if result.get("status") == "error":
+        print(f"Error: {result.get('message')}")
+        print("Make sure the server is running with: ./run serve")
+        return 1
+
+    print(f"Trained: {args.score:.1f} <- {args.url}")
+    return 0
+
+
+# ##################################################################
+# command train bulk
+# sends training data to server
+def command_train_bulk(args: argparse.Namespace) -> int:
+    if args.file:
+        with open(args.file) as f:
+            lines = f.read().strip().split("\n")
+    else:
+        print("Enter URL,score pairs (one per line, empty line to finish):")
+        lines = []
+        while True:
+            line = input()
+            if not line.strip():
+                break
+            lines.append(line)
+
+    items = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.rsplit(",", 1)
+        if len(parts) != 2:
+            print(f"Skipping invalid line: {line}")
+            continue
+        url, score_str = parts
+        try:
+            score = float(score_str)
+            items.append({"url": url.strip(), "score": score})
+            print(f"  {score:.0f} <- {url[:60]}...")
+        except ValueError:
+            print(f"Skipping invalid score: {line}")
+
+    if not items:
+        print("No valid training data to import.")
+        return 1
+
+    print(f"\nSending {len(items)} items to server...")
+    result = server_request("/train_bulk", method="POST", data={"items": items})
+
+    if result.get("status") == "error":
+        print(f"Error: {result.get('message')}")
+        print("Make sure the server is running with: ./run serve")
+        return 1
+
+    print(result.get("message", f"Added {result.get('count', 0)} training targets"))
+    return 0
+
+
+# ##################################################################
+# command stats
+# gets statistics from server
+def command_stats(args: argparse.Namespace) -> int:
+    result = server_request("/stats")
+
+    if result.get("status") == "error":
+        print(f"Error: {result.get('message')}")
+        print("Make sure the server is running with: ./run serve")
+        return 1
+
+    print("=== News Ranker Statistics ===\n")
+    print(f"Training samples:   {result.get('training_samples', 0)}")
+    print(f"With embeddings:    {result.get('with_embeddings', 0)}")
+    if result.get("avg_target_score"):
+        print(f"Avg target score:   {result['avg_target_score']:.2f}")
+    print(f"High quality (8+):  {result.get('high_quality_count', 0)}")
+    print(f"Low quality (<=3):  {result.get('low_quality_count', 0)}")
+
+    accuracy = result.get("accuracy", {})
+    if accuracy.get("total_corrections", 0) > 0:
+        print("\n--- Accuracy Metrics ---")
+        print(f"Total corrections:  {accuracy.get('total_corrections', 0)}")
+        if accuracy.get("avg_delta") is not None:
+            print(f"Avg delta (bias):   {accuracy['avg_delta']:+.2f}")
+        if accuracy.get("avg_abs_delta") is not None:
+            print(f"Avg |delta| (MAE):  {accuracy['avg_abs_delta']:.2f}")
+        recent = accuracy.get("recent_7d", {})
+        if recent.get("count", 0) > 0:
+            print(f"\nLast 7 days ({recent['count']} corrections):")
+            if recent.get("avg_delta") is not None:
+                print(f"  Avg delta:        {recent['avg_delta']:+.2f}")
+            if recent.get("avg_abs_delta") is not None:
+                print(f"  Avg |delta|:      {recent['avg_abs_delta']:.2f}")
+
+    last = result.get("last_training")
+    if last:
+        print("\n--- Last Training ---")
+        print(f"Type:               {last.get('type', 'unknown')}")
+        print(f"Status:             {last.get('status', 'unknown')}")
+        print(f"Samples:            {last.get('samples', 0)}")
+        if last.get("epochs"):
+            print(f"Epochs:             {last['epochs']}")
+        if last.get("best_loss") is not None:
+            print(f"Best loss:          {last['best_loss']:.4f}")
+        if last.get("completed_at"):
+            print(f"Completed:          {last['completed_at']}")
+
+    total_trainings = result.get("total_trainings", 0)
+    if total_trainings > 0:
+        print(f"\nTotal trainings:    {total_trainings}")
+
+    return 0
+
+
+# ##################################################################
+# command monitor
+# tails the training log file
+def command_monitor(args: argparse.Namespace) -> int:
+    log_file = Path("output/training.log")
+    if not log_file.exists():
+        print("No training log file yet. Training hasn't been run.")
+        print("Start monitoring with: ./run monitor")
+        print("Then trigger training with: ./run train <url> <score>")
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.touch()
+
+    print(f"Monitoring {log_file}... (Ctrl+C to stop)\n")
+    try:
+        return subprocess.call(["tail", "-f", str(log_file)])
+    except KeyboardInterrupt:
+        print("\nStopped monitoring.")
+        return 0
+
+
+# ##################################################################
+# main
+# parses arguments and dispatches to the appropriate command handler
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="News Ranker Development Tool")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_rank = sub.add_parser("rank", help="Rank a URL (optionally train with score)")
+    p_rank.add_argument("url", help="URL to rank")
+    p_rank.add_argument("score", nargs="?", type=float, default=None, help="Target score to train (1.0-10.0)")
+    p_rank.set_defaults(func=command_rank)
+
+    p_fetch = sub.add_parser(
+        "fetch-training",
+        help="Fetch extracted and cleaned HTML text for training URLs that lack it"
+    )
+    p_fetch.set_defaults(func=command_fetch_training)
+
+    p_retrain = sub.add_parser("retrain", help="Intensive retraining from all data")
+    p_retrain.set_defaults(func=command_retrain)
+
+    p_train = sub.add_parser("train", help="Train on a single URL with target score")
+    p_train.add_argument("url", help="URL to train on")
+    p_train.add_argument("score", type=float, help="Target score (1.0-10.0)")
+    p_train.set_defaults(func=command_train)
+
+    p_train_bulk = sub.add_parser("train-bulk", help="Import training data (url,score per line)")
+    p_train_bulk.add_argument("-f", "--file", help="File with url,score pairs")
+    p_train_bulk.set_defaults(func=command_train_bulk)
+
+    p_stats = sub.add_parser("stats", help="Show training data statistics")
+    p_stats.set_defaults(func=command_stats)
+
+    p_monitor = sub.add_parser("monitor", help="Monitor training progress (tails training.log)")
+    p_monitor.set_defaults(func=command_monitor)
+
+    p_test = sub.add_parser("test", help="Run a single test target")
+    p_test.add_argument("target", help="e.g. src/news_ranker_test.py::test_scoring")
+    p_test.set_defaults(func=command_test)
+
+    p_lint = sub.add_parser("lint", help="Run linter")
+    p_lint.set_defaults(func=command_lint)
+
+    p_serve = sub.add_parser("serve", help="Start the news ranker server")
+    p_serve.set_defaults(func=command_serve)
+
+    p_check = sub.add_parser("check", help="Run full suite and quality gates")
+    p_check.set_defaults(func=command_check)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+# ##################################################################
+# entry point
+# standard python pattern for dispatching main
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

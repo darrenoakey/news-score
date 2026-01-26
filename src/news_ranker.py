@@ -4,20 +4,23 @@ import sqlite3
 import pickle
 import asyncio
 import signal
+import threading
+import queue
+import time
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, BackgroundTasks, Query
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 import uvicorn
 import setproctitle
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from sentence_transformers import SentenceTransformer
 import trafilatura
 from playwright.sync_api import sync_playwright
@@ -69,8 +72,10 @@ EMBEDDING_DIM = 768
 EMBEDDING_MODEL_VERSION = 3
 CHUNK_SIZE_WORDS = 500
 MAX_SEQ_LENGTH = 512
-TRAINING_EPOCHS = 1000
-INTENSIVE_TRAINING_EPOCHS = 40000
+CORRECTION_EPOCHS = 50  # Epochs added per batch of corrections
+RETRAIN_EPOCHS = 500  # Epochs added by retrain command
+MAX_EPOCHS = 2000  # Cap on pending epochs
+SAVE_INTERVAL_EPOCHS = 50  # Save model every N epochs
 LEARNING_RATE = 0.001
 DROPOUT_RATE = 0.1
 HIDDEN_DIM = 128
@@ -80,6 +85,12 @@ MIN_SCORE = 1.0
 MAX_SCORE = 10.0
 DEFAULT_SCORE = 5.5
 SERVER_PORT = 19091
+
+# Worker pool configuration
+WORKER_POOL_SIZE = 6
+WORKER_MAX_AGE_SECONDS = 600  # 10 minutes
+WORKER_CYCLE_INTERVAL_SECONDS = 60  # Check for old workers every minute
+RANKING_TIMEOUT_SECONDS = 30
 
 
 # ##################################################################
@@ -140,6 +151,40 @@ def initialize_database() -> None:
     conn.commit()
     conn.close()
     check_model_version_migration()
+    cleanup_stale_training_records()
+
+
+# ##################################################################
+# ensure training history schema
+# adds pid column if missing
+def ensure_training_history_schema() -> None:
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(training_history)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "pid" not in columns:
+        cursor.execute("ALTER TABLE training_history ADD COLUMN pid INTEGER")
+        conn.commit()
+    conn.close()
+
+
+# ##################################################################
+# cleanup stale training records
+# marks any 'running' training records as 'interrupted' on startup
+# any record from a different pid or any running record is stale since we just started
+def cleanup_stale_training_records() -> None:
+    ensure_training_history_schema()
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE training_history SET status = 'interrupted', completed_at = CURRENT_TIMESTAMP "
+        "WHERE status = 'running'"
+    )
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    if affected > 0:
+        print(f"Cleaned up {affected} stale training record(s) from previous run.")
 
 
 # ##################################################################
@@ -251,8 +296,8 @@ def start_training_record(training_type: str, samples_count: int) -> Optional[in
     conn = get_database_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO training_history (training_type, samples_count, status) VALUES (?, ?, 'running')",
-        (training_type, samples_count)
+        "INSERT INTO training_history (training_type, samples_count, status, pid) VALUES (?, ?, 'running', ?)",
+        (training_type, samples_count, os.getpid())
     )
     record_id = cursor.lastrowid
     conn.commit()
@@ -447,6 +492,43 @@ class ScoringEngine:
             print("No saved weights found, using fresh model.")
         self.ranker.eval()
         self.is_training = False
+        self._training_lock = threading.Lock()  # Serialize training only
+        self._embedder_lock = threading.Lock()  # SentenceTransformer not thread-safe
+        # Cached training data for fast prediction (refreshed after training)
+        self._cached_samples: Optional[list[list[torch.Tensor]]] = None
+        self._cached_targets: Optional[torch.Tensor] = None
+        self._cached_user_profile: Optional[torch.Tensor] = None
+        self._cached_doc_vectors: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
+        self._refresh_prediction_cache()
+
+    # ##################################################################
+    # refresh prediction cache
+    # loads training data and precomputes user profile and doc vectors
+    def _refresh_prediction_cache(self) -> None:
+        rows = self.load_training_data()
+        if not rows:
+            self._cached_samples = None
+            self._cached_targets = None
+            self._cached_user_profile = None
+            self._cached_doc_vectors = None
+            return
+        samples, targets = self.prepare_training_samples(rows)
+        if not samples:
+            self._cached_samples = None
+            self._cached_targets = None
+            self._cached_user_profile = None
+            self._cached_doc_vectors = None
+            return
+        self._cached_samples = samples
+        self._cached_targets = targets
+        self._cached_user_profile = self.compute_user_profile_from_samples(samples, targets)
+        # Precompute document vectors for similarity lookup
+        doc_vectors = []
+        for sample, target in zip(samples, targets):
+            vec = self.compute_document_mean_vector(sample)
+            if vec is not None:
+                doc_vectors.append((vec, target))
+        self._cached_doc_vectors = doc_vectors if doc_vectors else None
 
     # ##################################################################
     # split into sentences
@@ -494,7 +576,8 @@ class ScoringEngine:
             return []
 
         with torch.no_grad():
-            embeddings = self.embedder.encode(flat_sentences, convert_to_tensor=True, show_progress_bar=False)
+            with self._embedder_lock:  # SentenceTransformer not thread-safe
+                embeddings = self.embedder.encode(flat_sentences, convert_to_tensor=True, show_progress_bar=False)
 
         chunk_tensors = []
         start = 0
@@ -621,31 +704,32 @@ class ScoringEngine:
     # predict score
     # runs inference to get a clamped score for text
     def predict_score(self, text: str) -> float:
+        # Snapshot shared state at start (atomic under GIL)
+        ranker = self.ranker
+        scale = self.calibration_scale
+        bias = self.calibration_bias
+        user_profile = self._cached_user_profile
+        doc_vectors = self._cached_doc_vectors
+
         with torch.no_grad():
             chunks = self.build_hierarchical_embeddings(text, to_cpu=False)
-            rows = self.load_training_data()
-            samples, targets = self.prepare_training_samples(rows)
-            user_profile = self.compute_user_profile_from_samples(samples, targets) if samples else None
-            raw_score = self.ranker(chunks, user_profile=user_profile).item()
-            calibrated = raw_score * self.calibration_scale + self.calibration_bias
 
-            if samples and targets.numel() > 0:
+            # Use snapshot ranker with cached user profile
+            raw_score = ranker(chunks, user_profile=user_profile).item()
+            calibrated = raw_score * scale + bias
+
+            # Similarity adjustment using cached doc vectors
+            if doc_vectors:
                 doc_vector = self.compute_document_mean_vector(chunks)
                 if doc_vector is not None:
-                    vector_targets = []
-                    for sample, target in zip(samples, targets):
-                        vec = self.compute_document_mean_vector(sample)
-                        if vec is not None:
-                            vector_targets.append((vec, target))
-                    if vector_targets:
-                        train_matrix = torch.stack([vec.to(DEVICE) for vec, _ in vector_targets])
-                        doc_vector = doc_vector.to(DEVICE)
-                        sims = F.cosine_similarity(train_matrix, doc_vector.unsqueeze(0), dim=1)
-                        max_sim, max_idx = torch.max(sims, dim=0)
-                        if max_sim.item() >= SIMILARITY_THRESHOLD:
-                            alpha = (max_sim.item() - SIMILARITY_THRESHOLD) / (1.0 - SIMILARITY_THRESHOLD)
-                            target_value = vector_targets[max_idx][1].item()
-                            calibrated = (1.0 - alpha) * calibrated + alpha * target_value
+                    train_matrix = torch.stack([vec.to(DEVICE) for vec, _ in doc_vectors])
+                    doc_vector = doc_vector.to(DEVICE)
+                    sims = F.cosine_similarity(train_matrix, doc_vector.unsqueeze(0), dim=1)
+                    max_sim, max_idx = torch.max(sims, dim=0)
+                    if max_sim.item() >= SIMILARITY_THRESHOLD:
+                        alpha = (max_sim.item() - SIMILARITY_THRESHOLD) / (1.0 - SIMILARITY_THRESHOLD)
+                        target_value = doc_vectors[max_idx][1].item()
+                        calibrated = (1.0 - alpha) * calibrated + alpha * target_value
 
             return self.clamp_score(calibrated)
 
@@ -699,73 +783,6 @@ class ScoringEngine:
         return new_ranker
 
     # ##################################################################
-    # train ranker
-    # runs training loop on the new ranker
-    def train_ranker(
-        self,
-        ranker: HierarchicalAttentionRanker,
-        x_train: list[list[torch.Tensor]],
-        y_train: torch.Tensor
-    ) -> float:
-        user_profile = self.compute_user_profile_from_samples(x_train, y_train)
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(ranker.parameters(), lr=LEARNING_RATE)
-        scheduler = CosineAnnealingLR(optimizer, T_max=TRAINING_EPOCHS)
-        loss = None
-        for _ in range(TRAINING_EPOCHS):
-            optimizer.zero_grad()
-            outputs = torch.stack([ranker(chunks, user_profile=user_profile) for chunks in x_train])
-            loss = criterion(outputs, y_train)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-        return loss.item() if loss else 0.0
-
-    # ##################################################################
-    # retrain
-    # trains a new model on user feedback and hot-swaps it in
-    def retrain(self) -> None:
-        if self.is_training:
-            training_log("Training already in progress. Skipping.")
-            return
-
-        self.is_training = True
-        record_id = None
-        try:
-            rows = self.load_training_data()
-            if not rows:
-                training_log("No training data found.")
-                return
-
-            training_log(f"=== QUICK RETRAIN START ({len(rows)} samples) ===")
-            record_id = start_training_record("quick", len(rows))
-            x_train, y_train = self.prepare_training_samples(rows)
-            if not x_train:
-                training_log("No valid training samples after embedding load.")
-                if record_id:
-                    complete_training_record(record_id, 0, 0.0, status="failed")
-                return
-
-            new_ranker = self.create_new_ranker()
-            final_loss = self.train_ranker(new_ranker, x_train, y_train)
-
-            new_ranker.eval()
-            user_profile = self.compute_user_profile_from_samples(x_train, y_train)
-            self.update_calibration(new_ranker, x_train, y_train, user_profile)
-            self.ranker = new_ranker
-            save_model_weights("ranker", self.ranker.state_dict())
-            training_log(f"=== QUICK RETRAIN COMPLETE (loss: {final_loss:.4f}) ===")
-            if record_id:
-                complete_training_record(record_id, TRAINING_EPOCHS, final_loss)
-        except Exception as e:
-            training_log(f"=== QUICK RETRAIN FAILED: {e} ===")
-            if record_id:
-                complete_training_record(record_id, 0, 0.0, status="failed")
-            raise
-        finally:
-            self.is_training = False
-
-    # ##################################################################
     # generate missing embeddings
     # creates embeddings for training data that lacks them
     def generate_missing_embeddings(self) -> int:
@@ -796,92 +813,435 @@ class ScoringEngine:
         return count
 
     # ##################################################################
-    # intensive retrain
-    # resets model and trains from scratch with more epochs
-    def intensive_retrain(self) -> None:
-        if self.is_training:
-            training_log("Training already in progress. Skipping.")
-            return
+    # retrain
+    # synchronous training for tests and CLI - trains for fixed epochs
+    def retrain(self, epochs: int = 100) -> None:
+        with self._training_lock:
+            if self.is_training:
+                training_log("Training already in progress. Skipping.")
+                return
+            self.is_training = True
 
-        self.is_training = True
-        record_id = None
-        final_epoch = 0
-        best_loss = float("inf")
         try:
-            missing = self.generate_missing_embeddings()
-            if missing > 0:
-                training_log(f"Generated {missing} missing embeddings")
-
             rows = self.load_training_data()
-            rows = [(emb, target) for emb, target in rows if emb is not None]
-
             if not rows:
-                training_log("No training data with embeddings found.")
+                training_log("No training data found.")
                 return
 
-            training_log(f"=== INTENSIVE RETRAIN START ({len(rows)} samples, {INTENSIVE_TRAINING_EPOCHS} max epochs) ===")
-            record_id = start_training_record("intensive", len(rows))
             x_train, y_train = self.prepare_training_samples(rows)
             if not x_train:
                 training_log("No valid training samples after embedding load.")
-                if record_id:
-                    complete_training_record(record_id, 0, 0.0, status="failed")
                 return
 
-            new_ranker = self.create_new_ranker()
+            ranker = self.create_new_ranker()
             user_profile = self.compute_user_profile_from_samples(x_train, y_train)
-
+            optimizer = torch.optim.Adam(ranker.parameters(), lr=LEARNING_RATE)
             criterion = nn.MSELoss()
-            optimizer = optim.Adam(new_ranker.parameters(), lr=LEARNING_RATE)
-            scheduler = CosineAnnealingLR(optimizer, T_max=INTENSIVE_TRAINING_EPOCHS)
 
+            best_loss = float("inf")
             best_state = None
-            patience = 5000
-            epochs_without_improvement = 0
-
-            for epoch in range(INTENSIVE_TRAINING_EPOCHS):
+            for _ in range(epochs):
                 optimizer.zero_grad()
-                outputs = torch.stack([new_ranker(chunks, user_profile=user_profile) for chunks in x_train])
+                outputs = torch.stack([ranker(chunks, user_profile=user_profile) for chunks in x_train])
                 loss = criterion(outputs, y_train)
                 loss.backward()
                 optimizer.step()
-                scheduler.step()
-
-                current_loss = loss.item()
-                if current_loss < best_loss:
-                    best_loss = current_loss
-                    best_state = {k: v.clone() for k, v in new_ranker.state_dict().items()}
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
-
-                if (epoch + 1) % 1000 == 0:
-                    lr = scheduler.get_last_lr()[0]
-                    training_log(f"  Epoch {epoch + 1}/{INTENSIVE_TRAINING_EPOCHS}, Loss: {current_loss:.4f}, Best: {best_loss:.4f}, LR: {lr:.6f}")
-
-                if epochs_without_improvement >= patience:
-                    training_log(f"  Early stopping at epoch {epoch + 1} (no improvement for {patience} epochs)")
-                    final_epoch = epoch + 1
-                    break
-            else:
-                final_epoch = INTENSIVE_TRAINING_EPOCHS
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    best_state = {k: v.clone() for k, v in ranker.state_dict().items()}
 
             if best_state:
-                new_ranker.load_state_dict(best_state)
-            new_ranker.eval()
-            self.update_calibration(new_ranker, x_train, y_train, user_profile)
-            self.ranker = new_ranker
+                ranker.load_state_dict(best_state)
+            ranker.eval()
+            self.update_calibration(ranker, x_train, y_train, user_profile)
+            self.ranker = ranker
             save_model_weights("ranker", self.ranker.state_dict())
-            training_log(f"=== INTENSIVE RETRAIN COMPLETE (best loss: {best_loss:.4f}, epochs: {final_epoch}) ===")
-            if record_id:
-                complete_training_record(record_id, final_epoch, best_loss, best_loss)
-        except Exception as e:
-            training_log(f"=== INTENSIVE RETRAIN FAILED: {e} ===")
-            if record_id:
-                complete_training_record(record_id, final_epoch, best_loss, status="failed")
-            raise
+            self._refresh_prediction_cache()
         finally:
             self.is_training = False
+
+
+# ##################################################################
+# ranking request dataclass
+# represents a request in the ranking queue
+@dataclass
+class RankingRequest:
+    request_id: str
+    text: str
+
+
+# ##################################################################
+# ranking response dataclass
+# represents a response from a worker
+@dataclass
+class RankingResponse:
+    request_id: str
+    score: float
+    error: Optional[str] = None
+
+
+# ##################################################################
+# ranking worker
+# independent worker with its own embedder for parallel ranking
+class RankingWorker:
+
+    def __init__(self, worker_id: int, shared_state: dict) -> None:
+        self.worker_id = worker_id
+        self.shared_state = shared_state  # Contains ranker, calibration, cached data
+        self.created_at = time.time()
+        self.shutdown_requested = False  # Graceful shutdown flag
+        print(f"Worker {worker_id}: Loading embedder...")
+        self.embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device=DEVICE)
+        self.embedder.max_seq_length = MAX_SEQ_LENGTH
+        print(f"Worker {worker_id}: Ready")
+
+    def is_expired(self) -> bool:
+        return (time.time() - self.created_at) > WORKER_MAX_AGE_SECONDS
+
+    def request_shutdown(self) -> None:
+        self.shutdown_requested = True
+
+    def split_into_sentences(self, text: str) -> list[str]:
+        cleaned = re.sub(r'\s+', ' ', text).strip()
+        if not cleaned:
+            return []
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        return [sentence.strip() for sentence in sentences if sentence.strip()]
+
+    def chunk_sentences(self, sentences: list[str]) -> list[list[str]]:
+        chunks = []
+        current = []
+        current_words = 0
+        for sentence in sentences:
+            word_count = len(sentence.split())
+            if current and current_words + word_count > CHUNK_SIZE_WORDS:
+                chunks.append(current)
+                current = []
+                current_words = 0
+            current.append(sentence)
+            current_words += word_count
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def build_hierarchical_embeddings(self, text: str) -> list[torch.Tensor]:
+        sentences = self.split_into_sentences(text)
+        if not sentences:
+            return []
+        chunks = self.chunk_sentences(sentences)
+        flat_sentences = [sentence for chunk in chunks for sentence in chunk]
+        sizes = [len(chunk) for chunk in chunks]
+        if not flat_sentences:
+            return []
+        with torch.no_grad():
+            # Each worker has its own embedder - no lock needed!
+            embeddings = self.embedder.encode(flat_sentences, convert_to_tensor=True, show_progress_bar=False)
+        chunk_tensors = []
+        start = 0
+        for size in sizes:
+            end = start + size
+            chunk_tensors.append(embeddings[start:end])
+            start = end
+        return chunk_tensors
+
+    def compute_document_mean_vector(self, chunks: list[torch.Tensor]) -> Optional[torch.Tensor]:
+        if not chunks:
+            return None
+        sentence_tensors = [chunk for chunk in chunks if chunk.numel() > 0]
+        if not sentence_tensors:
+            return None
+        sentence_matrix = torch.cat(sentence_tensors, dim=0)
+        if sentence_matrix.numel() == 0:
+            return None
+        return torch.mean(sentence_matrix, dim=0)
+
+    def predict_score(self, text: str) -> float:
+        # Snapshot shared state (atomic under GIL)
+        ranker = self.shared_state.get("ranker")
+        scale = self.shared_state.get("calibration_scale", 1.0)
+        bias = self.shared_state.get("calibration_bias", 0.0)
+        user_profile = self.shared_state.get("user_profile")
+        doc_vectors = self.shared_state.get("doc_vectors")
+
+        with torch.no_grad():
+            chunks = self.build_hierarchical_embeddings(text)
+            if not chunks:
+                return DEFAULT_SCORE
+
+            raw_score = ranker(chunks, user_profile=user_profile).item()
+            calibrated = raw_score * scale + bias
+
+            if doc_vectors:
+                doc_vector = self.compute_document_mean_vector(chunks)
+                if doc_vector is not None:
+                    train_matrix = torch.stack([vec.to(DEVICE) for vec, _ in doc_vectors])
+                    doc_vector = doc_vector.to(DEVICE)
+                    sims = F.cosine_similarity(train_matrix, doc_vector.unsqueeze(0), dim=1)
+                    max_sim, max_idx = torch.max(sims, dim=0)
+                    if max_sim.item() >= SIMILARITY_THRESHOLD:
+                        alpha = (max_sim.item() - SIMILARITY_THRESHOLD) / (1.0 - SIMILARITY_THRESHOLD)
+                        target_value = doc_vectors[max_idx][1].item()
+                        calibrated = (1.0 - alpha) * calibrated + alpha * target_value
+
+            return max(MIN_SCORE, min(MAX_SCORE, calibrated))
+
+
+# ##################################################################
+# worker pool
+# manages a pool of ranking workers for parallel processing
+class WorkerPool:
+
+    def __init__(self, engine: ScoringEngine) -> None:
+        self.engine = engine
+        self.request_queue: queue.Queue[RankingRequest] = queue.Queue()
+        self.response_map: dict[str, RankingResponse] = {}
+        self.response_lock = threading.Lock()
+        self.response_events: dict[str, threading.Event] = {}
+        self.workers: list[tuple[RankingWorker, threading.Thread]] = []
+        self.running = True
+        self.shared_state = self._build_shared_state()
+        self._start_workers()
+
+    def _build_shared_state(self) -> dict:
+        return {
+            "ranker": self.engine.ranker,
+            "calibration_scale": self.engine.calibration_scale,
+            "calibration_bias": self.engine.calibration_bias,
+            "user_profile": self.engine._cached_user_profile,
+            "doc_vectors": self.engine._cached_doc_vectors,
+        }
+
+    def refresh_shared_state(self) -> None:
+        # Called after training completes - update in-place so workers see changes
+        new_state = self._build_shared_state()
+        self.shared_state.update(new_state)
+        training_log(f"Model pushed to {len(self.workers)} workers")
+
+    def _start_workers(self) -> None:
+        for i in range(WORKER_POOL_SIZE):
+            self._spawn_worker(i)
+
+    def _spawn_worker(self, worker_id: int) -> None:
+        worker = RankingWorker(worker_id, self.shared_state)
+        thread = threading.Thread(target=self._worker_loop, args=(worker,), daemon=True)
+        thread.start()
+        self.workers.append((worker, thread))
+
+    def _worker_loop(self, worker: RankingWorker) -> None:
+        while self.running:
+            # Check for graceful shutdown BETWEEN tasks (not during)
+            if worker.shutdown_requested:
+                print(f"Worker {worker.worker_id}: Graceful shutdown after {time.time() - worker.created_at:.0f}s")
+                break
+
+            try:
+                request = self.request_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            # Process the task to completion before checking shutdown
+            try:
+                score = worker.predict_score(request.text)
+                response = RankingResponse(request_id=request.request_id, score=score)
+            except Exception as e:
+                response = RankingResponse(request_id=request.request_id, score=0.0, error=str(e))
+
+            with self.response_lock:
+                self.response_map[request.request_id] = response
+                if request.request_id in self.response_events:
+                    self.response_events[request.request_id].set()
+
+        print(f"Worker {worker.worker_id}: Exited")
+
+    def submit_request(self, text: str) -> str:
+        request_id = str(uuid.uuid4())
+        event = threading.Event()
+        with self.response_lock:
+            self.response_events[request_id] = event
+        self.request_queue.put(RankingRequest(request_id=request_id, text=text))
+        return request_id
+
+    def get_response(self, request_id: str, timeout: float) -> Optional[RankingResponse]:
+        event = self.response_events.get(request_id)
+        if not event:
+            return None
+        if not event.wait(timeout=timeout):
+            return None
+        with self.response_lock:
+            response = self.response_map.pop(request_id, None)
+            self.response_events.pop(request_id, None)
+        return response
+
+    def cycle_workers(self) -> None:
+        # Clean up dead workers from the list
+        self.workers = [(w, t) for w, t in self.workers if t.is_alive()]
+        alive_count = len(self.workers)
+
+        # Request graceful shutdown for the oldest expired worker (one per cycle)
+        # Only if we're at or above target (don't request shutdown if understaffed)
+        if alive_count >= WORKER_POOL_SIZE:
+            expired_workers = [(w, t) for w, t in self.workers
+                               if w.is_expired() and not w.shutdown_requested]
+            if expired_workers:
+                oldest_worker = min(expired_workers, key=lambda wt: wt[0].created_at)[0]
+                print(f"Worker {oldest_worker.worker_id}: Requesting shutdown (age={time.time() - oldest_worker.created_at:.0f}s)")
+                oldest_worker.request_shutdown()
+
+        # Spawn new workers if we're below target
+        # This happens naturally as workers shut down gracefully
+        while alive_count < WORKER_POOL_SIZE:
+            new_id = max((w.worker_id for w, _ in self.workers), default=-1) + 1
+            self._spawn_worker(new_id)
+            alive_count += 1
+
+    def shutdown(self) -> None:
+        self.running = False
+        for _, thread in self.workers:
+            thread.join(timeout=5.0)
+
+
+# ##################################################################
+# training loop
+# continuous training with epoch-by-epoch processing and corrections queue
+class TrainingLoop:
+
+    def __init__(self, engine: ScoringEngine, worker_pool: "WorkerPool") -> None:
+        self.engine = engine
+        self.worker_pool = worker_pool
+        self.epochs_queue: queue.Queue[int] = queue.Queue()
+        self.running = True
+        self._lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def add_epochs(self, count: int) -> None:
+        """Add epochs to the training queue (will be capped at MAX_EPOCHS)"""
+        self.epochs_queue.put(count)
+
+    def _run(self) -> None:
+        epochs_remaining = 0
+        ranker = None
+        optimizer = None
+        x_train = None
+        y_train = None
+        user_profile = None
+        best_loss = float("inf")
+        best_state = None
+        epoch_count = 0
+        last_log_time = time.time()
+        last_save_epoch = 0
+        record_id = None
+        samples_count = 0
+
+        while self.running:
+            # 1. Collect any new epoch requests
+            while True:
+                try:
+                    new_epochs = self.epochs_queue.get_nowait()
+                    epochs_remaining = min(epochs_remaining + new_epochs, MAX_EPOCHS)
+                except queue.Empty:
+                    break
+
+            # 2. If no epochs remaining, sleep and continue
+            if epochs_remaining <= 0:
+                time.sleep(0.5)
+                continue
+
+            # 3. Initialize or reload training if needed
+            if ranker is None:
+                # Generate any missing embeddings first
+                missing = self.engine.generate_missing_embeddings()
+                if missing > 0:
+                    training_log(f"Generated {missing} missing embeddings")
+
+                rows = self.engine.load_training_data()
+                rows = [(emb, target) for emb, target in rows if emb is not None]
+                if not rows:
+                    training_log("No training data with embeddings found.")
+                    epochs_remaining = 0
+                    continue
+
+                x_train, y_train = self.engine.prepare_training_samples(rows)
+                if not x_train:
+                    training_log("No valid training samples after embedding load.")
+                    epochs_remaining = 0
+                    continue
+
+                samples_count = len(rows)
+                ranker = self.engine.create_new_ranker()
+                user_profile = self.engine.compute_user_profile_from_samples(x_train, y_train)
+                optimizer = torch.optim.Adam(ranker.parameters(), lr=LEARNING_RATE)
+                best_loss = float("inf")
+                best_state = None
+                epoch_count = 0
+                last_save_epoch = 0
+                record_id = start_training_record("continuous", samples_count)
+                training_log(f"=== TRAINING START ({samples_count} samples, {epochs_remaining} epochs queued) ===")
+
+            # 4. Do one epoch
+            criterion = nn.MSELoss()
+            optimizer.zero_grad()
+            outputs = torch.stack([ranker(chunks, user_profile=user_profile) for chunks in x_train])
+            loss = criterion(outputs, y_train)
+            loss.backward()
+            optimizer.step()
+
+            current_loss = loss.item()
+            epoch_count += 1
+            epochs_remaining -= 1
+
+            if current_loss < best_loss:
+                best_loss = current_loss
+                best_state = {k: v.clone() for k, v in ranker.state_dict().items()}
+
+            # 5. Log every minute
+            now = time.time()
+            if now - last_log_time >= 60:
+                avg_error = best_loss ** 0.5
+                training_log(f"  epoch {epoch_count}, {epochs_remaining} remaining, avg error: ±{avg_error:.2f} pts")
+                last_log_time = now
+
+            # 6. Save periodically
+            if epoch_count - last_save_epoch >= SAVE_INTERVAL_EPOCHS:
+                self._save_model(ranker, best_state, x_train, y_train, user_profile)
+                last_save_epoch = epoch_count
+
+            # 7. If done with current batch, finalize
+            if epochs_remaining <= 0:
+                self._save_model(ranker, best_state, x_train, y_train, user_profile)
+                avg_error = best_loss ** 0.5
+                training_log(f"=== TRAINING COMPLETE ({epoch_count} epochs, avg error: ±{avg_error:.2f} pts) ===")
+                if record_id:
+                    complete_training_record(record_id, epoch_count, best_loss, best_loss)
+                ranker = None  # Reset for next training batch
+                record_id = None
+
+    def _save_model(
+        self,
+        ranker: HierarchicalAttentionRanker,
+        best_state: Optional[dict],
+        x_train: list,
+        y_train: torch.Tensor,
+        user_profile: Optional[torch.Tensor]
+    ) -> None:
+        if best_state:
+            ranker.load_state_dict(best_state)
+        ranker.eval()
+        self.engine.update_calibration(ranker, x_train, y_train, user_profile)
+        self.engine.ranker = ranker
+        save_model_weights("ranker", ranker.state_dict())
+        self.engine._refresh_prediction_cache()
+        self.worker_pool.refresh_shared_state()
+        ranker.train()
+
+    def shutdown(self) -> None:
+        self.running = False
+        self.thread.join(timeout=5.0)
+
+
+# Global pool and training loop
+worker_pool: Optional[WorkerPool] = None
+training_loop: Optional[TrainingLoop] = None
 
 
 # ##################################################################
@@ -921,6 +1281,20 @@ def get_training_stats() -> dict:
     return {"total_articles": total, "trained_articles": trained, "avg_target": avg}
 
 
+# ##################################################################
+# training set
+# returns all trained URLs and their user target scores
+def training_set() -> list[dict]:
+    conn = get_database_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT url, user_target_rank FROM articles WHERE user_target_rank IS NOT NULL"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"url": row[0], "score": row[1]} for row in rows]
+
+
 # global engine instance
 engine: Optional[ScoringEngine] = None
 
@@ -931,15 +1305,23 @@ RETRAIN_INTERVAL_SECONDS = 2 * 60 * 60
 
 # ##################################################################
 # scheduled retrain task
-# runs retrain every 2 hours in the background
+# runs retrain every 2 hours in the background via training loop
 async def scheduled_retrain_task() -> None:
     while True:
         await asyncio.sleep(RETRAIN_INTERVAL_SECONDS)
         print("Scheduled retrain starting...")
-        try:
-            engine.retrain()
-        except Exception as e:
-            print(f"Scheduled retrain failed: {e}")
+        if training_loop:
+            training_loop.add_epochs(RETRAIN_EPOCHS)
+
+
+# ##################################################################
+# worker cycling task
+# cycles out oldest worker every minute to keep workers fresh
+async def worker_cycling_task() -> None:
+    while True:
+        await asyncio.sleep(WORKER_CYCLE_INTERVAL_SECONDS)
+        if worker_pool:
+            worker_pool.cycle_workers()
 
 
 # ##################################################################
@@ -947,13 +1329,19 @@ async def scheduled_retrain_task() -> None:
 # manages startup and shutdown of the fastapi application
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine
+    global engine, worker_pool, training_loop
     initialize_database()
     engine = ScoringEngine()
+    worker_pool = WorkerPool(engine)
+    training_loop = TrainingLoop(engine, worker_pool)
     retrain_task = asyncio.create_task(scheduled_retrain_task())
-    print("System initialized and ready. Scheduled retrain every 2 hours.")
+    cycling_task = asyncio.create_task(worker_cycling_task())
+    print(f"System initialized with {WORKER_POOL_SIZE} workers. Scheduled retrain every 2 hours.")
     yield
     retrain_task.cancel()
+    cycling_task.cancel()
+    training_loop.shutdown()
+    worker_pool.shutdown()
     print("Shutting down system...")
 
 
@@ -1108,8 +1496,22 @@ async def rank_article(url: str = Query(..., min_length=1)):
         if not extracted_text:
             return {"url": url, "rank": 0.0, "source": "unavailable"}
 
-        score = engine.predict_score(extracted_text)
-        return {"url": url, "rank": score, "source": "ok"}
+        # Submit to worker pool and wait for response
+        if not worker_pool:
+            return {"url": url, "rank": 0.0, "source": "error"}
+
+        request_id = worker_pool.submit_request(extracted_text)
+        # Wait in executor to not block event loop
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, worker_pool.get_response, request_id, RANKING_TIMEOUT_SECONDS
+        )
+
+        if response is None:
+            return {"url": url, "rank": 0.0, "source": "timeout"}
+        if response.error:
+            return {"url": url, "rank": 0.0, "source": "error"}
+        return {"url": url, "rank": response.score, "source": "ok"}
     except Exception:
         return {"url": url, "rank": 0.0, "source": "error"}
 
@@ -1191,7 +1593,7 @@ def update_article_texts(
 # correct rank endpoint
 # accepts user feedback and triggers retraining, always returns 200
 @app.post("/correct_rank")
-async def correct_rank(payload: CorrectRankRequest, background_tasks: BackgroundTasks):
+async def correct_rank(payload: CorrectRankRequest):
     try:
         exists, extracted_text, cleaned_html_text, embedding_blob = get_article_state(payload.url)
         predicted_score = None
@@ -1240,8 +1642,9 @@ async def correct_rank(payload: CorrectRankRequest, background_tasks: Background
             delta = payload.score - predicted_score
             training_log(f"Correction: predicted={predicted_score:.2f}, actual={payload.score:.1f}, delta={delta:+.2f}")
 
-        background_tasks.add_task(engine.retrain)
-        return {"status": "accepted", "message": "Feedback received. Retraining initiated."}
+        if training_loop:
+            training_loop.add_epochs(CORRECTION_EPOCHS)
+        return {"status": "accepted", "message": "Feedback received. Training epochs added."}
     except Exception:
         return {"status": "error", "message": "Could not process request."}
 
@@ -1266,7 +1669,7 @@ class TrainBulkRequest(BaseModel):
 # train bulk endpoint
 # accepts list of url/score pairs for bulk training
 @app.post("/train_bulk")
-async def train_bulk(payload: TrainBulkRequest, background_tasks: BackgroundTasks):
+async def train_bulk(payload: TrainBulkRequest):
     try:
         count = 0
         for item in payload.items:
@@ -1277,8 +1680,8 @@ async def train_bulk(payload: TrainBulkRequest, background_tasks: BackgroundTask
             set_training_target(url, float(score))
             count += 1
 
-        if count > 0:
-            background_tasks.add_task(engine.retrain)
+        if count > 0 and training_loop:
+            training_loop.add_epochs(CORRECTION_EPOCHS)
 
         return {"status": "accepted", "count": count, "message": f"Added {count} training targets."}
     except Exception as e:
@@ -1345,19 +1748,20 @@ async def fetch_training_endpoint():
 
 # ##################################################################
 # retrain endpoint
-# triggers intensive retraining from all training data
+# adds training epochs to the queue
 @app.post("/retrain")
-async def retrain_endpoint(background_tasks: BackgroundTasks):
+async def retrain_endpoint():
     try:
         stats = get_training_stats()
         if stats["trained_articles"] == 0:
             return {"status": "error", "message": "No training data available."}
 
-        background_tasks.add_task(engine.intensive_retrain)
+        if training_loop:
+            training_loop.add_epochs(RETRAIN_EPOCHS)
         return {
             "status": "accepted",
             "training_samples": stats["trained_articles"],
-            "message": "Intensive retraining initiated."
+            "message": f"Added {RETRAIN_EPOCHS} training epochs."
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1455,6 +1859,18 @@ async def stats_endpoint():
 
 
 # ##################################################################
+# training set endpoint
+# returns all trained URLs and their user target scores
+@app.get("/training_set")
+async def training_set_endpoint():
+    try:
+        data = training_set()
+        return {"items": data, "count": len(data)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ##################################################################
 # main
 # entry point that starts the uvicorn server
 def main() -> None:
@@ -1463,7 +1879,60 @@ def main() -> None:
 
 
 # ##################################################################
+# crash protection constants
+MAX_RESTART_ATTEMPTS = 10
+RESTART_DELAY_SECONDS = 5
+RESTART_BACKOFF_MULTIPLIER = 2
+MAX_RESTART_DELAY_SECONDS = 300
+
+
+# ##################################################################
+# run with crash protection
+# wraps main() to catch all exceptions and restart automatically
+def run_with_crash_protection() -> None:
+    import traceback
+    from datetime import datetime
+
+    attempt = 0
+    delay = RESTART_DELAY_SECONDS
+
+    while attempt < MAX_RESTART_ATTEMPTS:
+        try:
+            attempt += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if attempt > 1:
+                print(f"[{timestamp}] Restart attempt {attempt}/{MAX_RESTART_ATTEMPTS}")
+            main()
+            # If main() returns normally (clean shutdown), don't restart
+            print(f"[{timestamp}] Server stopped normally")
+            break
+        except KeyboardInterrupt:
+            print("\nShutdown requested by user")
+            break
+        except SystemExit as e:
+            # Respect explicit exit requests
+            if e.code == 0:
+                print("Server exited cleanly")
+            else:
+                print(f"Server exited with code {e.code}")
+            break
+        except Exception as e:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{timestamp}] CRASH DETECTED: {type(e).__name__}: {e}")
+            print(f"Stack trace:\n{traceback.format_exc()}")
+
+            if attempt < MAX_RESTART_ATTEMPTS:
+                print(f"[{timestamp}] Restarting in {delay} seconds...")
+                time.sleep(delay)
+                # Exponential backoff
+                delay = min(delay * RESTART_BACKOFF_MULTIPLIER, MAX_RESTART_DELAY_SECONDS)
+            else:
+                print(f"[{timestamp}] Max restart attempts ({MAX_RESTART_ATTEMPTS}) reached. Giving up.")
+                raise
+
+
+# ##################################################################
 # entry point
 # standard python pattern for running as script
 if __name__ == "__main__":
-    main()
+    run_with_crash_protection()
