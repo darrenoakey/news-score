@@ -1035,7 +1035,7 @@ class WorkerPool:
                 break
 
             try:
-                request = self.request_queue.get(timeout=1.0)
+                request = self.request_queue.get(timeout=5.0)
             except queue.Empty:
                 continue
 
@@ -1122,6 +1122,7 @@ class TrainingLoop:
         epochs_remaining = 0
         ranker = None
         optimizer = None
+        criterion = None
         x_train = None
         y_train = None
         user_profile = None
@@ -1134,18 +1135,21 @@ class TrainingLoop:
         samples_count = 0
 
         while self.running:
-            # 1. Collect any new epoch requests
+            # 1. If no epochs remaining, block efficiently waiting for work
+            if epochs_remaining <= 0:
+                try:
+                    new_epochs = self.epochs_queue.get(timeout=5.0)
+                    epochs_remaining = min(new_epochs, MAX_EPOCHS)
+                except queue.Empty:
+                    continue
+
+            # 2. Collect any additional queued epoch requests (non-blocking drain)
             while True:
                 try:
                     new_epochs = self.epochs_queue.get_nowait()
                     epochs_remaining = min(epochs_remaining + new_epochs, MAX_EPOCHS)
                 except queue.Empty:
                     break
-
-            # 2. If no epochs remaining, sleep and continue
-            if epochs_remaining <= 0:
-                time.sleep(0.5)
-                continue
 
             # 3. Initialize or reload training if needed
             if ranker is None:
@@ -1171,6 +1175,7 @@ class TrainingLoop:
                 ranker = self.engine.create_new_ranker()
                 user_profile = self.engine.compute_user_profile_from_samples(x_train, y_train)
                 optimizer = torch.optim.Adam(ranker.parameters(), lr=LEARNING_RATE)
+                criterion = nn.MSELoss()
                 best_loss = float("inf")
                 best_state = None
                 epoch_count = 0
@@ -1179,7 +1184,6 @@ class TrainingLoop:
                 training_log(f"=== TRAINING START ({samples_count} samples, {epochs_remaining} epochs queued) ===")
 
             # 4. Do one epoch
-            criterion = nn.MSELoss()
             optimizer.zero_grad()
             outputs = torch.stack([ranker(chunks, user_profile=user_profile) for chunks in x_train])
             loss = criterion(outputs, y_train)
@@ -1189,6 +1193,9 @@ class TrainingLoop:
             current_loss = loss.item()
             epoch_count += 1
             epochs_remaining -= 1
+
+            # Small sleep to prevent 100% CPU during training
+            time.sleep(0.01)
 
             if current_loss < best_loss:
                 best_loss = current_loss
