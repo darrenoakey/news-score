@@ -64,3 +64,12 @@ The server has built-in crash protection:
 - SentenceTransformer is NOT thread-safe - each worker has its own embedder instance
 - Workers are cycled every 10 minutes to prevent memory accumulation
 - The run script must be executed from project root (it changes cwd on startup)
+
+## CPU Usage Patterns
+
+The background threads are designed to minimize CPU usage when idle:
+
+- **Training loop**: Uses blocking `queue.get(timeout=5.0)` when no training queued. Do NOT use spinning `get_nowait()` patterns.
+- **Worker pool**: 5-second idle timeout (not 1s) - with 6 workers, shorter timeouts cause excessive wake-ups
+- **Epoch throttling**: 10ms sleep between training epochs prevents 100% CPU during training
+- **MSELoss**: Instantiated once per training session, not per epoch
