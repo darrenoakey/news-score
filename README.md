@@ -180,3 +180,7 @@ curl -X POST http://localhost:19091/correct_rank \
 # Now score new articles - predictions will reflect your preferences
 ./run rank "https://example.com/new-article"
 ```
+
+## License
+
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev) - free to use and modify, but no commercial use without permission.
